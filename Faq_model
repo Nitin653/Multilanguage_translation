@@ -1,0 +1,128 @@
+// server.js - Main Entry Point
+const express = require("express");
+const mongoose = require("mongoose");
+const dotenv = require("dotenv");
+const faqRoutes = require("./routes/faqRoutes");
+const Redis = require("ioredis");
+
+dotenv.config();
+const app = express();
+const redis = new Redis();
+
+app.use(express.json());
+
+// Connect to MongoDB
+mongoose.connect(process.env.MONGO_URI, {
+  useNewUrlParser: true,
+  useUnifiedTopology: true,
+})
+.then(() => console.log("MongoDB connected"))
+.catch((err) => console.error("MongoDB connection error:", err));
+
+// Routes
+app.use("/api/faqs", faqRoutes);
+
+const PORT = process.env.PORT || 5000;
+app.listen(PORT, () => {
+  console.log(`Server running on port ${PORT}`);
+});
+
+// models/FAQ.js - FAQ Model
+const mongoose = require("mongoose");
+
+const FAQSchema = new mongoose.Schema({
+  question: { type: String, required: true },
+  answer: { type: String, required: true },
+  translations: {
+    en: { type: String },
+    hi: { type: String },
+    bn: { type: String }
+  }
+}, { timestamps: true });
+
+module.exports = mongoose.model("FAQ", FAQSchema);
+
+// routes/faqRoutes.js - FAQ Routes
+const express = require("express");
+const router = express.Router();
+const FAQ = require("../models/FAQ");
+const Redis = require("ioredis");
+const redis = new Redis();
+const axios = require("axios");
+
+// Get FAQs with language support
+router.get("/", async (req, res) => {
+  try {
+    const lang = req.query.lang || "en";
+    const cachedData = await redis.get(`faqs_${lang}`);
+    if (cachedData) {
+      return res.json(JSON.parse(cachedData));
+    }
+    const faqs = await FAQ.find();
+    const translatedFAQs = faqs.map(faq => ({
+      question: faq.translations[lang] || faq.question,
+      answer: faq.translations[lang] || faq.answer
+    }));
+    await redis.set(`faqs_${lang}`, JSON.stringify(translatedFAQs), "EX", 3600);
+    res.json(translatedFAQs);
+  } catch (error) {
+    res.status(500).json({ message: "Server Error" });
+  }
+});
+
+// Add FAQ with translation
+router.post("/", async (req, res) => {
+  try {
+    const { question, answer } = req.body;
+    const translations = { en: question };
+    const googleTranslateApi = "https://translation.googleapis.com/language/translate/v2";
+    const targetLanguages = ["hi", "bn"];
+    for (const lang of targetLanguages) {
+      const response = await axios.post(googleTranslateApi, {
+        q: question,
+        target: lang,
+        key: process.env.GOOGLE_TRANSLATE_API_KEY
+      });
+      translations[lang] = response.data.data.translations[0].translatedText;
+    }
+    const newFAQ = new FAQ({ question, answer, translations });
+    await newFAQ.save();
+    res.status(201).json(newFAQ);
+  } catch (error) {
+    res.status(500).json({ message: "Error adding FAQ" });
+  }
+});
+
+module.exports = router;
+
+// tests/faq.test.js - Unit Tests
+const request = require("supertest");
+const app = require("../server");
+const mongoose = require("mongoose");
+const FAQ = require("../models/FAQ");
+
+beforeAll(async () => {
+  await mongoose.connect(process.env.MONGO_URI, {
+    useNewUrlParser: true,
+    useUnifiedTopology: true,
+  });
+});
+
+afterAll(async () => {
+  await mongoose.connection.close();
+});
+
+describe("FAQ API", () => {
+  it("should fetch FAQs", async () => {
+    const res = await request(app).get("/api/faqs");
+    expect(res.statusCode).toEqual(200);
+  });
+  
+  it("should add a new FAQ", async () => {
+    const newFAQ = { question: "What is Node.js?", answer: "Node.js is a runtime environment." };
+    const res = await request(app).post("/api/faqs").send(newFAQ);
+    expect(res.statusCode).toEqual(201);
+    expect(res.body.question).toBe(newFAQ.question);
+  });
+});
+
